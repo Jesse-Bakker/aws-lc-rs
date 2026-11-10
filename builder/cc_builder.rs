@@ -19,11 +19,12 @@ mod win_x86_64;
 
 use crate::nasm_builder::NasmBuilder;
 use crate::{
-    cargo_env, compiler_is_cl_like, emit_warning, env_var_to_bool, execute_command,
-    export_crate_compilers, find_clang_cl, get_crate_cc, get_crate_cflags, is_cross_compiling,
-    is_link_whole_archive, is_no_asm, is_small, out_dir, requested_c_std, set_env_for_target,
-    should_build_jitter_entropy, target, target_arch, target_env, target_is_msvc, target_os,
-    target_vendor, use_prebuilt_nasm, CStdRequested, EnvGuard, OutputLibType,
+    cargo_env, cc_target_env_names, compiler_is_cl_like, emit_warning, env_var_to_bool,
+    execute_command, export_crate_compilers, find_clang_cl, get_crate_cc, get_crate_cflags,
+    is_cross_compiling, is_link_whole_archive, is_no_asm, is_small, out_dir, requested_c_std,
+    set_env_for_target, should_build_jitter_entropy, target, target_arch, target_env,
+    target_is_msvc, target_os, target_vendor, use_prebuilt_nasm, CStdRequested, EnvGuard,
+    OutputLibType,
 };
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -1007,18 +1008,7 @@ impl CcBuilder {
 /// `include_target_prefixed` adds `TARGET_CFLAGS`: cc reads it when cross-compiling
 /// and `HOST_CFLAGS` otherwise, so callers that may cross-compile need both.
 fn cflags_env_names(include_target_prefixed: bool) -> Vec<String> {
-    let target = target();
-    // cc 1.2.26 replaces only `-`, while newer versions replace both `-` and `.`.
-    // Include both spellings because either version may satisfy our dependency range.
-    let target_u_legacy = target.replace('-', "_");
-    let target_u = target.replace(['-', '.'], "_");
-    let mut names = vec![
-        format!("CFLAGS_{target}"),
-        format!("CFLAGS_{target_u_legacy}"),
-    ];
-    if target_u != target_u_legacy {
-        names.push(format!("CFLAGS_{target_u}"));
-    }
+    let mut names = cc_target_env_names("CFLAGS");
     names.push("HOST_CFLAGS".to_string());
     if include_target_prefixed {
         names.push("TARGET_CFLAGS".to_string());

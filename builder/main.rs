@@ -1114,21 +1114,57 @@ fn probe_apple_core_services() -> bool {
 // (e.g., as a transitive build-dependency).
 // See: https://github.com/aws/aws-lc-rs/issues/1169
 fn get_crate_cc() -> Option<String> {
-    let host_or_target = if is_cross_compiling() {
-        optional_env_optional_crate_target("TARGET_CC")
-    } else {
-        optional_env_optional_crate_target("HOST_CC")
-    };
-    host_or_target.or(optional_env_optional_crate_target("CC"))
+    get_crate_compiler("CC")
 }
 
 fn get_crate_cxx() -> Option<String> {
-    let host_or_target = if is_cross_compiling() {
-        optional_env_optional_crate_target("TARGET_CXX")
+    get_crate_compiler("CXX")
+}
+
+/// Looks up the compiler for `name` ("CC" or "CXX") and returns the first
+/// variable set, in this order (shown for "CC"):
+/// 1. `AWS_LC_SYS_TARGET_CC` when cross-compiling, else `AWS_LC_SYS_HOST_CC`
+/// 2. `AWS_LC_SYS_CC`
+/// 3. `CC_<target>`, in each spelling that cc reads
+/// 4. `TARGET_CC` when cross-compiling, else `HOST_CC`
+/// 5. `CC`
+///
+/// Steps 3 to 5 follow cc's own order. The result is exported as
+/// `CC_<target>`, which cc reads first, so a generic `HOST_CC` must not win
+/// over a `CC_<target>` that is already set.
+fn get_crate_compiler(name: &str) -> Option<String> {
+    let kind = if is_cross_compiling() {
+        "TARGET"
     } else {
-        optional_env_optional_crate_target("HOST_CXX")
+        "HOST"
     };
-    host_or_target.or(optional_env_optional_crate_target("CXX"))
+    let kind_name = format!("{kind}_{name}");
+    optional_env_crate_target(&kind_name)
+        .or(optional_env_crate_target(name))
+        .or(cc_target_env_names(name)
+            .iter()
+            .map(optional_env)
+            .fold(None, Option::or))
+        .or(optional_env_target(&kind_name))
+        .or(optional_env(name))
+}
+
+/// The target-specific spellings of `name` that cc reads, e.g.
+/// `CC_aarch64-apple-darwin` and `CC_aarch64_apple_darwin` for "CC".
+/// cc replaces both `-` and `.` in the triple. The spelling with only `-`
+/// replaced is included too, because `set_env_for_target` writes that one.
+pub(crate) fn cc_target_env_names(name: &str) -> Vec<String> {
+    let target = target();
+    let target_u_legacy = target.replace('-', "_");
+    let target_u = target.replace(['-', '.'], "_");
+    let mut names = vec![
+        format!("{name}_{target}"),
+        format!("{name}_{target_u_legacy}"),
+    ];
+    if target_u != target_u_legacy {
+        names.push(format!("{name}_{target_u}"));
+    }
+    names
 }
 
 /// Exports the crate's compiler selection (e.g. `AWS_LC_SYS_CC`) as the
@@ -1973,5 +2009,113 @@ mod tests {
         assert!(!is_lto_flag("-ffunction-sections"));
         assert!(!is_lto_flag("-fdata-sections"));
         assert!(!is_lto_flag("-fuse-ld=lld"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Compiler selection tests
+    // -------------------------------------------------------------------------
+
+    const LINUX_X86_64: &str = "x86_64-unknown-linux-gnu";
+    const LINUX_AARCH64: &str = "aarch64-unknown-linux-gnu";
+
+    /// Sets up a build of aws-lc-sys for `target` on `host` in which only
+    /// `vars` select the compiler. Every other variable with a `CC` or `CXX`
+    /// part in its name is removed until the guards drop. The caller must hold
+    /// `ENV_MUTEX`.
+    fn compiler_env(host: &str, target: &str, vars: &[(&str, &str)]) -> Vec<EnvGuard> {
+        let mut guards: Vec<EnvGuard> = env::vars()
+            .map(|(key, _)| key)
+            .filter(|key| key.split('_').any(|part| part == "CC" || part == "CXX"))
+            .filter(|key| !vars.iter().any(|(name, _)| name == key))
+            .map(|key| EnvGuard::remove(&key))
+            .collect();
+        guards.push(EnvGuard::new("HOST", host));
+        guards.push(EnvGuard::new("TARGET", target));
+        guards.push(EnvGuard::new("CARGO_PKG_NAME", "aws-lc-sys"));
+        guards.extend(vars.iter().map(|(name, value)| EnvGuard::new(name, value)));
+        guards
+    }
+
+    #[test]
+    fn test_cc_target_beats_host_cc() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        for cc_target in ["CC_x86_64_unknown_linux_gnu", "CC_x86_64-unknown-linux-gnu"] {
+            let _env = compiler_env(
+                LINUX_X86_64,
+                LINUX_X86_64,
+                &[(cc_target, "clang"), ("HOST_CC", "gcc"), ("CC", "cc")],
+            );
+            assert_eq!(get_crate_cc().as_deref(), Some("clang"), "{cc_target}");
+        }
+    }
+
+    #[test]
+    fn test_cxx_target_beats_host_cxx() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = compiler_env(
+            LINUX_X86_64,
+            LINUX_X86_64,
+            &[
+                ("CXX_x86_64_unknown_linux_gnu", "clang++"),
+                ("HOST_CXX", "g++"),
+            ],
+        );
+        assert_eq!(get_crate_cxx().as_deref(), Some("clang++"));
+    }
+
+    // A cross compiler in `CC` must not reach native builds (#1169).
+    #[test]
+    fn test_host_cc_beats_cc() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = compiler_env(
+            LINUX_X86_64,
+            LINUX_X86_64,
+            &[("HOST_CC", "gcc"), ("CC", "aarch64-linux-gnu-gcc")],
+        );
+        assert_eq!(get_crate_cc().as_deref(), Some("gcc"));
+    }
+
+    // OpenWrt sets `CC` to the host compiler and `TARGET_CC` to the cross
+    // compiler (#1026).
+    #[test]
+    fn test_target_cc_beats_cc_when_cross() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = compiler_env(
+            LINUX_X86_64,
+            LINUX_AARCH64,
+            &[
+                ("TARGET_CC", "aarch64-openwrt-linux-gcc"),
+                ("HOST_CC", "gcc"),
+                ("CC", "gcc"),
+            ],
+        );
+        assert_eq!(get_crate_cc().as_deref(), Some("aarch64-openwrt-linux-gcc"));
+    }
+
+    #[test]
+    fn test_crate_cc_beats_cc_target() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let generic = [
+            ("CC_x86_64_unknown_linux_gnu", "clang"),
+            ("HOST_CC", "gcc"),
+            ("CC", "cc"),
+        ];
+        {
+            let vars = [&generic[..], &[("AWS_LC_SYS_CC", "zig cc")]].concat();
+            let _env = compiler_env(LINUX_X86_64, LINUX_X86_64, &vars);
+            assert_eq!(get_crate_cc().as_deref(), Some("zig cc"));
+        }
+        {
+            let vars = [
+                &generic[..],
+                &[
+                    ("AWS_LC_SYS_CC", "zig cc"),
+                    ("AWS_LC_SYS_HOST_CC", "host cc"),
+                ],
+            ]
+            .concat();
+            let _env = compiler_env(LINUX_X86_64, LINUX_X86_64, &vars);
+            assert_eq!(get_crate_cc().as_deref(), Some("host cc"));
+        }
     }
 }
